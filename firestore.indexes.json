@@ -1,0 +1,10 @@
+{
+  "indexes": [
+    {"collectionGroup":"shops","queryScope":"COLLECTION","fields":[{"fieldPath":"pin","order":"ASCENDING"},{"fieldPath":"active","order":"ASCENDING"}]},
+    {"collectionGroup":"orders","queryScope":"COLLECTION","fields":[{"fieldPath":"userId","order":"ASCENDING"},{"fieldPath":"created_at","order":"DESCENDING"}]},
+    {"collectionGroup":"orders","queryScope":"COLLECTION","fields":[{"fieldPath":"userId","order":"ASCENDING"},{"fieldPath":"idempotencyKey","order":"ASCENDING"}]},
+    {"collectionGroup":"orders","queryScope":"COLLECTION","fields":[{"fieldPath":"shopId","order":"ASCENDING"},{"fieldPath":"created_at","order":"DESCENDING"}]},
+    {"collectionGroup":"orders","queryScope":"COLLECTION","fields":[{"fieldPath":"deliveryUid","order":"ASCENDING"},{"fieldPath":"created_at","order":"DESCENDING"}]}
+  ],
+  "fieldOverrides": []
+}

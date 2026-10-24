@@ -1,0 +1,158 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function userPath(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function hasProfile() { return signedIn() && exists(userPath(request.auth.uid)); }
+    function profile() { return get(userPath(request.auth.uid)).data; }
+    function activeRole(role) {
+      return hasProfile() && profile().active == true && profile().role == role;
+    }
+    function isAdmin() { return activeRole('admin'); }
+    function isCustomer() { return activeRole('customer'); }
+    function isDeliveryPartner() { return activeRole('delivery_partner'); }
+    function isShopOwner(shopId) {
+      return activeRole('shop_owner')
+        && profile().shopId == shopId
+        && exists(/databases/$(database)/documents/shops/$(shopId))
+        && get(/databases/$(database)/documents/shops/$(shopId)).data.active == true;
+    }
+    function validStatusEdit() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'updated_at', 'history'])
+        && request.resource.data.history is list
+        && request.resource.data.history.size() == resource.data.history.size() + 1
+        && request.resource.data.history[request.resource.data.history.size() - 1].status
+          == request.resource.data.status;
+    }
+    function validShopTransition() {
+      return validStatusEdit() && (
+        (resource.data.status == 'awaiting_shop_acceptance'
+          && request.resource.data.status in ['accepted', 'rejected'])
+        || (resource.data.status == 'accepted' && request.resource.data.status == 'preparing')
+        || (resource.data.status == 'preparing'
+          && request.resource.data.status == 'ready_for_pickup')
+        || (resource.data.fulfillment_method == 'store_pickup'
+          && resource.data.status == 'ready_for_pickup'
+          && request.resource.data.status == 'collected')
+      );
+    }
+    function validDeliveryTransition() {
+      return validStatusEdit() && (
+        (resource.data.status == 'delivery_partner_assigned'
+          && request.resource.data.status == 'picked_up')
+        || (resource.data.status == 'picked_up'
+          && request.resource.data.status == 'out_for_delivery')
+        || (resource.data.status == 'out_for_delivery'
+          && request.resource.data.status == 'delivered')
+      );
+    }
+    function validAdminAssignment() {
+      let partnerId = request.resource.data.deliveryUid;
+      return resource.data.status == 'ready_for_pickup'
+        && resource.data.fulfillment_method != 'store_pickup'
+        && resource.data.deliveryUid == null
+        && partnerId is string
+        && exists(userPath(partnerId))
+        && get(userPath(partnerId)).data.role == 'delivery_partner'
+        && get(userPath(partnerId)).data.active == true
+        && request.resource.data.delivery_partner_user_id == partnerId
+        && request.resource.data.status == 'delivery_partner_assigned'
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['deliveryUid', 'delivery_partner_user_id', 'delivery_partner_name',
+            'status', 'updated_at', 'history']);
+    }
+    function validAdminStaffEdit() {
+      let changed = request.resource.data.diff(resource.data).affectedKeys();
+      return resource.data.role in ['shop_owner', 'delivery_partner']
+        && changed.hasOnly(['active', 'role', 'shopId', 'deliveryZone', 'updatedAt'])
+        && request.resource.data.role in ['shop_owner', 'delivery_partner']
+        && (!changed.hasAny(['role', 'shopId'])
+          || (request.resource.data.role == 'shop_owner'
+            && request.resource.data.shopId is string
+            && exists(/databases/$(database)/documents/shops/$(request.resource.data.shopId))
+            && get(/databases/$(database)/documents/shops/$(request.resource.data.shopId)).data.active == true)
+          || (request.resource.data.role == 'delivery_partner'
+            && request.resource.data.deliveryZone is string
+            && request.resource.data.deliveryZone.size() >= 2));
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isAdmin());
+      // Self-registration can create customer profiles only. Staff profiles are provisioned
+      // by a trusted backend; Firebase Cloud Functions are not configured in this project yet.
+      allow create: if signedIn() && request.auth.uid == userId
+        && request.resource.data.role == 'customer'
+        && request.resource.data.active == true
+        && request.resource.data.keys().hasOnly([
+          'name', 'email', 'loginId', 'phone', 'pin', 'address', 'role', 'active',
+          'anonymous', 'createdAt'
+        ]);
+      allow update: if (isAdmin() && validAdminStaffEdit())
+        || (signedIn() && request.auth.uid == userId
+          && request.resource.data.role == resource.data.role
+          && request.resource.data.active == resource.data.active
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['name', 'phone', 'pin', 'address', 'updatedAt']));
+      allow delete: if isAdmin() && resource.data.role != 'admin';
+    }
+
+    match /products/{productId} {
+      allow read: if resource.data.active == true || isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /categories/{categoryId} {
+      allow read: if resource.data.active == true || isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /shops/{shopId} {
+      allow read: if resource.data.active == true || isAdmin() || isShopOwner(shopId);
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['name', 'locality', 'address', 'pin',
+          'status', 'active', 'createdAt'])
+        && request.resource.data.status == 'pending'
+        && request.resource.data.active == false;
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['status', 'active', 'updatedAt'])
+        && request.resource.data.status in ['pending', 'active', 'suspended', 'rejected']
+        && request.resource.data.active == (request.resource.data.status == 'active');
+      allow delete: if false;
+    }
+
+    match /storefront/{documentId} {
+      allow read: if resource.data.active == true || isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+
+    match /orders/{orderId} {
+      // Client-supplied prices and totals are not authoritative. Until a trusted order
+      // backend is deployed, deny browser order creation entirely.
+      allow create: if false;
+      allow read: if isAdmin()
+        || (isCustomer() && resource.data.userId == request.auth.uid)
+        || isShopOwner(resource.data.shopId)
+        || (isDeliveryPartner() && resource.data.deliveryUid == request.auth.uid);
+      allow update: if (isAdmin() && validAdminAssignment())
+        || (isShopOwner(resource.data.shopId) && validShopTransition())
+        || (isDeliveryPartner() && resource.data.deliveryUid == request.auth.uid
+          && validDeliveryTransition());
+      // Orders and their audit history are retained; cancel/reversal flows belong in backend.
+      allow delete: if false;
+    }
+
+    match /notifications/{notificationId} {
+      allow read: if isAdmin()
+        || (signedIn() && resource.data.userId == request.auth.uid)
+        || isShopOwner(resource.data.shopId);
+      allow write: if false;
+    }
+
+    // Unknown collections are denied by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
